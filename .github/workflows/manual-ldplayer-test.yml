@@ -1,0 +1,170 @@
+name: Pure LDPlayer 9 Windows Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  ldplayer-diagnostic:
+    name: LDPlayer 9 Installation & Virtualization Diagnostic
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify Windows Virtualization & Hyper-V Environment
+        shell: powershell
+        run: |
+          Write-Host "=== [1/6] Hardware Virtualization & Hyper-V Inspection ===" -ForegroundColor Cyan
+          $cpu = Get-CimInstance Win32_Processor
+          Write-Host "CPU Name:                       $($cpu.Name)"
+          Write-Host "Virtualization Firmware:        $($cpu.VirtualizationFirmwareEnabled)"
+          Write-Host "Hyper-V Requirements:           $($cpu.SecondLevelAddressTranslationExtensions)"
+          
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host "Hypervisor Present:             $($cs.HypervisorPresent)"
+          Write-Host "Total Physical Memory:          $([math]::Round($cs.TotalPhysicalMemory / 1GB, 2)) GB"
+
+      - name: Setup Android Platform-Tools (ADB)
+        shell: powershell
+        run: |
+          Write-Host "=== [2/6] Setting Up ADB Platform-Tools ===" -ForegroundColor Cyan
+          $adbZip = "$env:TEMP\platform-tools.zip"
+          if (-not (Test-Path "C:\platform-tools\adb.exe")) {
+              & curl.exe -# -fSL -o $adbZip "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+              Expand-Archive -Path $adbZip -DestinationPath "C:\" -Force
+          }
+          echo "C:\platform-tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH += ";C:\platform-tools"
+          & C:\platform-tools\adb.exe version
+
+      - name: Download Official LDPlayer 9 Installer
+        shell: powershell
+        run: |
+          Write-Host "=== [3/6] Downloading Official LDPlayer 9 ===" -ForegroundColor Cyan
+          $installerPath = "$env:TEMP\LDPlayer9.exe"
+          & curl.exe -# -fSL --retry 3 --connect-timeout 30 -o $installerPath "https://encdn.ldmnq.com/download/package/LDPlayer9.exe"
+          $sizeMb = [math]::Round((Get-Item $installerPath).Length / 1MB, 2)
+          Write-Host "[+] Downloaded installer: $installerPath ($sizeMb MB)" -ForegroundColor Green
+
+      - name: Execute Installer & Verify File Generation
+        shell: powershell
+        run: |
+          Write-Host "=== [4/6] Executing Silent Installation & Monitoring Output ===" -ForegroundColor Cyan
+          $installerPath = "$env:TEMP\LDPlayer9.exe"
+          
+          # Test standard silent installation to C:\LDPlayer\LDPlayer9
+          Write-Host "Running: $installerPath /S /D=C:\LDPlayer\LDPlayer9" -ForegroundColor Yellow
+          $process = Start-Process -FilePath $installerPath -ArgumentList "/S", "/D=C:\LDPlayer\LDPlayer9" -PassThru
+          
+          # Monitor process and filesystem for up to 60 seconds
+          $finished = $false
+          for ($i = 1; $i -le 20; $i++) {
+              if ($process.HasExited) {
+                  Write-Host "[+] Installer process exited with code: $($process.ExitCode)" -ForegroundColor Green
+                  $finished = $true
+                  break
+              }
+              Write-Host "Poll [$i/20] Installer is still running (PID: $($process.Id))..."
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $finished) {
+              Write-Host "[-] Installer did not exit within timeout. Inspecting state..." -ForegroundColor DarkYellow
+          }
+
+          Write-Host "`nScanning system directories for generated LDPlayer files..." -ForegroundColor Cyan
+          $scanRoots = @("C:\LDPlayer", "C:\leidian", "$env:ProgramFiles\LDPlayer*", "${env:ProgramFiles(x86)}\LDPlayer*", "$env:LOCALAPPDATA\Programs\LDPlayer*")
+          foreach ($root in $scanRoots) {
+              if (Test-Path $root) {
+                  Write-Host "FOUND Directory: $root" -ForegroundColor Green
+                  Get-ChildItem -Path $root -Recurse -Depth 3 | Select-Object -First 25 | ForEach-Object { Write-Host "   $($_.FullName)" }
+              }
+          }
+
+      - name: Discover Executable & Launch Instance
+        shell: powershell
+        run: |
+          Write-Host "=== [5/6] Locating LDPlayer Engine Executable ===" -ForegroundColor Cyan
+          $searchDirs = @("C:\LDPlayer", "C:\leidian", "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA")
+          $foundLd = $null
+          
+          foreach ($dir in $searchDirs) {
+              if (Test-Path $dir) {
+                  $candidate = Get-ChildItem -Path $dir -Filter "*console.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+                  if (-not $candidate) {
+                      $candidate = Get-ChildItem -Path $dir -Filter "*player.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+                  }
+                  if ($candidate) {
+                      $foundLd = $candidate
+                      break
+                  }
+              }
+          }
+
+          if ($foundLd) {
+              Write-Host "[+] FOUND Engine Executable: $foundLd" -ForegroundColor Green
+              Write-Host "Dispatching launch command: $foundLd launch --index 0" -ForegroundColor Yellow
+              Start-Process -FilePath $foundLd -ArgumentList "launch --index 0" -NoNewWindow
+              echo "FOUND_EXE=$foundLd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+              Write-Host "[-] No console or player executable found on system." -ForegroundColor Red
+          }
+
+      - name: Dynamic Port Discovery & ADB Device Inspection
+        shell: powershell
+        run: |
+          $env:PATH += ";C:\platform-tools"
+          Write-Host "=== [6/6] Dynamic Port Discovery & ADB Inspection ===" -ForegroundColor Cyan
+          & C:\platform-tools\adb.exe start-server
+          
+          $testPorts = @(5555, 5554, 5556, 5558)
+          $connected = $false
+          
+          for ($i = 1; $i -le 10; $i++) {
+              Write-Host "`n--- Poll Attempt [$i/10] ---" -ForegroundColor Yellow
+              foreach ($port in $testPorts) {
+                  & C:\platform-tools\adb.exe connect "127.0.0.1:$port" | Out-Null
+              }
+              
+              $devices = & C:\platform-tools\adb.exe devices
+              Write-Host "Active ADB Devices:"
+              Write-Host "$devices"
+              
+              if ($devices -match "127\.0\.0\.1:\d+\s+device" -or $devices -match "emulator-\d+\s+device") {
+                  $connected = $true
+                  Write-Host "`n[+] SUCCESS: Device detected in ADB!" -ForegroundColor Green
+                  break
+              }
+              Start-Sleep -Seconds 4
+          }
+
+          Write-Host "`nActive Running Processes Summary:" -ForegroundColor Cyan
+          Get-Process | Where-Object { $_.ProcessName -match "LD|dn|leidian|vbox|qemu" } | Format-Table -Property Id, ProcessName, CPU, WorkingSet64 -AutoSize
+
+      - name: Notify Central Backend Run Complete
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "=== [TEARDOWN] Notifying central backend of LDPlayer test completion (${{ job.status }}) ===" -ForegroundColor Cyan
+          $backendUrl = if ($env:TIKTOK_BOOSTER_BACKEND_URL) { $env:TIKTOK_BOOSTER_BACKEND_URL } else { "https://api.fgos.site/tiktok" }
+          $body = @{
+              repo_name = $env:GITHUB_REPOSITORY
+              run_id = [int64]$env:GITHUB_RUN_ID
+              status = "${{ job.status }}"
+              runner_index = 0
+              provider = "ldplayer"
+          } | ConvertTo-Json -Compress
+          try {
+              $headers = @{ "Content-Type" = "application/json"; "x-runner-secret" = "$env:RUNNER_SECRET" }
+              Invoke-RestMethod -Uri "$backendUrl/api/runners/workflow-done" -Method Post -Headers $headers -Body $body -TimeoutSec 10
+              Write-Host "[+] Central backend notified successfully." -ForegroundColor Green
+          } catch {
+              Write-Host "[-] Backend notification notice: $_" -ForegroundColor DarkYellow
+          }
+        env:
+          TIKTOK_BOOSTER_BACKEND_URL: ${{ secrets.TIKTOK_BOOSTER_BACKEND_URL || secrets.FGOS_BACKEND_URL || 'https://api.fgos.site/tiktok' }}
+          RUNNER_SECRET: ${{ secrets.RUNNER_SECRET }}

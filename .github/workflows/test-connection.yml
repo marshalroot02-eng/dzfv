@@ -1,0 +1,31 @@
+name: System & Automation Diagnostic Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnostic-check:
+    name: Run System Diagnostic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Test System Config & Modules
+        run: |
+          python -c "
+          from src.config import config
+          import src.models
+          import src.auto_login
+          import src.main
+          print('System config and automation modules loaded successfully without external dependencies!')
+          "
